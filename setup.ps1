@@ -20,6 +20,8 @@ if (-not (Test-Path -LiteralPath $VenvPython)) {
     & $PythonCommand @PythonPrefix -m venv (Join-Path $ProjectRoot ".venv")
 }
 if ($LASTEXITCODE -ne 0) { throw "Could not create the app's Python environment." }
+& $VenvPython -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+if ($LASTEXITCODE -ne 0) { throw "Python 3.10 or newer is required to run this app." }
 
 Write-Host "Installing Personal RAG Assistant requirements..."
 & $VenvPython -m pip install --upgrade pip
