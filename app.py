@@ -62,8 +62,10 @@ def api_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     base_url, key = api_config()
     url = f"{base_url}/{path.lstrip('/')}"
     try:
-        response = requests.post(url, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=payload, timeout=180)
+        response = requests.post(url, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=payload, timeout=(10, 330))
         response.raise_for_status()
+    except requests.Timeout as exc:
+        raise RuntimeError("KerocheAI took too long to finish this part. The revision guide is now split into smaller requests; try a lighter installed model if this continues.") from exc
     except requests.RequestException as exc:
         detail = ""
         if getattr(exc, "response", None) is not None:
@@ -85,10 +87,10 @@ def api_models() -> list[str]:
         return []
 
 
-def chat(messages: list[dict[str, str]], model: str, temperature: float = 0.2) -> str:
+def chat(messages: list[dict[str, str]], model: str, temperature: float = 0.2, max_tokens: int = 768) -> str:
     if not model:
         raise RuntimeError("Choose an installed KerocheAI model in the sidebar.")
-    result = api_post("chat/completions", {"model": model, "messages": messages, "temperature": temperature})
+    result = api_post("chat/completions", {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens})
     try:
         return result["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError) as exc:
@@ -190,6 +192,61 @@ def answer(question: str, sources: list[dict[str, Any]], model: str, extend: boo
                  {"role": "user", "content": f"Question: {question}\n\nRetrieved excerpts:\n{source_text}"}], model) or "No answer was generated."
 
 
+def build_revision_guide(passages: list[dict[str, Any]], model: str, allow_extension: bool, status, progress) -> str:
+    batch_size = 4
+    batches = [passages[i:i + batch_size] for i in range(0, len(passages), batch_size)]
+    summaries = []
+    for batch_index, batch in enumerate(batches, start=1):
+        source_start = (batch_index - 1) * batch_size + 1
+        context = "\n\n".join(
+            f"[S{source_index}] {source['filename']} ({source['location']})\n{source['content']}"
+            for source_index, source in enumerate(batch, source_start)
+        )
+        status.update(label=f"Reviewing source group {batch_index} of {len(batches)}")
+        summaries.append(chat([
+            {"role": "system", "content": (
+                "You are extracting evidence for an exam revision guide. Use only the excerpts. "
+                "Write concise topic notes containing definitions, principles, steps, comparisons, "
+                "advantages, disadvantages, and examples that are present. Copy each exam question "
+                "you can see as accurately as possible, keeping its paper/year label. Give a short "
+                "answer when the excerpts support one; otherwise say the notes in this group do not "
+                "cover the answer. Cite each item with its supplied [S#]. Do not guess years, counts, "
+                "or missing facts. Keep this extraction brief."
+            )},
+            {"role": "user", "content": context},
+        ], model, max_tokens=420))
+        progress.progress(batch_index / (len(batches) + 2))
+
+    status.update(label="Writing revision notes and past-paper answers")
+    allow_text = "Clearly label any necessary outside academic knowledge as 'Beyond the uploaded notes'." if allow_extension else "Do not use outside knowledge; mark missing answers as not covered in the uploaded notes."
+    synthesis = "\n\n".join(f"Source group {i}:\n{summary}" for i, summary in enumerate(summaries, 1))
+    core = chat([
+        {"role": "system", "content": (
+            "Create a concise, exam-friendly guide using only the evidence summaries. Preserve their [S#] citations. "
+            "Do not invent course facts, paper years, question repetition counts, or answers. Count a recurring "
+            "question only when the extracted questions show the repetition; group genuinely equivalent wording "
+            "as the same concept and state that grouping. Write only these sections: 1. Short Revision Notes by topic; "
+            "2. Most Frequently Asked Questions ranked by observed frequency, with count and paper/year; "
+            "3. Answers to every theory question extracted from the supplied papers. Keep answers concise but useful. "
+            + allow_text
+        )},
+        {"role": "user", "content": synthesis},
+    ], model, max_tokens=900)
+    progress.progress((len(batches) + 1) / (len(batches) + 2))
+    status.update(label="Preparing the final exam-focus lists")
+    focus = chat([
+        {"role": "system", "content": (
+            "Using only the evidence summaries, write these sections of a concise exam revision guide: "
+            "4. Top Definitions; 5. Top Concepts; 6. Top Likely Exam Questions with model answers; "
+            "7. Last-Minute Revision Sheet. Preserve [S#] citations, do not invent facts, and provide up to 20 "
+            "items where evidence supports them. If fewer are supported, include fewer. " + allow_text
+        )},
+        {"role": "user", "content": synthesis},
+    ], model, max_tokens=900)
+    progress.progress(1.0)
+    return f"{core}\n\n{focus}".strip() or "No guide generated."
+
+
 def library_rows():
     return db().execute("SELECT filename, category, COUNT(*) AS pieces, MIN(created_at) AS added FROM chunks GROUP BY file_hash ORDER BY filename").fetchall()
 
@@ -200,7 +257,7 @@ def delete_file(filename: str):
 
 title_icon, title_text = st.columns([0.09, 0.91], vertical_alignment="center")
 with title_icon:
-    st.image(str(ICON_PATH), width=58)
+    st.image(str(ICON_PATH), width=58, alt="Personal RAG Assistant icon")
 with title_text:
     st.title("Personal RAG Assistant")
     st.caption("Upload your own documents, ask questions, and get answers grounded in cited passages from your library.")
@@ -222,7 +279,7 @@ with st.sidebar:
         st.text_input("KerocheAI model name", value=configured_model, key="selected_model")
     uploads = st.file_uploader("Add documents", type=["pdf", "docx", "pptx", "txt", "md"], accept_multiple_files=True)
     category = st.selectbox("Document type", ["Lecture notes", "Course outline", "Past paper", "Other"])
-    if st.button("Index uploaded documents", type="primary", disabled=not uploads, use_container_width=True):
+    if st.button("Index uploaded documents", type="primary", disabled=not uploads, width="stretch"):
         progress = st.progress(0)
         for i, file in enumerate(uploads):
             try:
@@ -277,21 +334,33 @@ with tab_chat:
 with tab_guide:
     st.subheader("Build an exam revision guide")
     st.write("Generate study notes, recurring-question analysis, model answers, and final revision lists from the documents you indexed.")
+    st.caption("The guide reviews up to 24 relevant passages in smaller groups to reduce KerocheAI timeouts. Large courses may take several minutes; consider generating separate guides for notes and past papers.")
     scope = st.multiselect("Include these document types", cats, default=cats, key="guide_scope")
     extend = st.checkbox("Allow clearly labelled academic knowledge when the notes are insufficient", value=True)
     if st.button("Generate revision guide", type="primary", disabled=not rows):
         query = "Course key definitions, concepts, principles, advantages, disadvantages, comparisons, lists, and examples. Past paper questions and their years or paper labels. Provide evidence for a comprehensive exam revision guide."
-        with st.spinner("Finding relevant passages and drafting your guide…"):
-            try:
-                passages = retrieve(query, scope, limit=35)
-                instructions = "Create a structured exam revision guide with: 1. Short Revision Notes organized by topic/subtopic; 2. Most Frequently Asked Questions ranked by repetition with counts and papers/years when available; 3. Answers to all theory questions found in the supplied past-paper passages; 4. Top Definitions; 5. Top Concepts; 6. Top Likely Exam Questions with answers; 7. a one-page Last-Minute Revision Sheet. Use bullets and tables where useful. Cite source markers [S#]. Never claim a frequency/year unless visible in the excerpts. Clearly flag answers that extend beyond the uploaded material."
-                context = "\n\n".join(f"[S{i}] {s['filename']} ({s['location']})\n{s['content']}" for i, s in enumerate(passages, 1))
-                st.session_state.guide = chat([
-                    {"role": "system", "content": "You are a source-grounded exam revision assistant. Do not invent course material, years, or question repetitions. " + instructions},
-                    {"role": "user", "content": f"Additional knowledge allowed: {extend}. Build the guide only from this retrieved evidence.\n\n{context}"}], st.session_state.get("selected_model", "")) or "No guide generated."
-                st.session_state.guide_sources = passages
-            except Exception as exc:
-                st.error(str(exc))
+        try:
+            passages = retrieve(query, scope, limit=24)
+            if not passages:
+                st.warning("I couldn't find matching passages. Check your selected document types or try indexing the files again.")
+            else:
+                progress = st.progress(0)
+                with st.status("Preparing the revision guide", expanded=True) as guide_status:
+                    try:
+                        st.session_state.guide = build_revision_guide(
+                            passages,
+                            st.session_state.get("selected_model", ""),
+                            extend,
+                            guide_status,
+                            progress,
+                        )
+                        st.session_state.guide_sources = passages
+                        guide_status.update(label="Revision guide ready", state="complete")
+                    except Exception:
+                        guide_status.update(label="Revision guide could not be completed", state="error")
+                        raise
+        except Exception as exc:
+            st.error(str(exc))
     if st.session_state.get("guide"):
         st.markdown(st.session_state.guide)
         with st.expander("Retrieved source passages"):
