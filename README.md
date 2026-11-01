@@ -7,6 +7,8 @@ A local Streamlit study assistant that prefers KerocheAI and automatically falls
 - Upload PDF, DOCX, PPTX, TXT, and Markdown files.
 - Label documents as lecture notes, course outlines, past papers, or other.
 - Store extracted passages in a local SQLite library and retrieve them using BM25.
+- Keep separate chat histories, each with its own attached documents and source citations.
+- Start a new chat, return to an earlier conversation, and attach documents from the shared local library.
 - Generate cited answers and multi-stage exam revision guides.
 - Use KerocheAI first, then fall back to a compatible local Ollama model if needed.
 - Bind the web app to localhost with upload size and request protection settings.
@@ -47,6 +49,7 @@ Set `PERSONAL_RAG_DATA` to change where the local SQLite library is stored.
 
 ## Operational notes
 
+- Chat messages and their source citations persist locally. Each chat searches only documents attached to that chat; removing an attachment leaves the file in the shared library, while deleting a library file removes it from every chat.
 - Ollama fallback uses a local model and does not require a remote AI API account.
 - Files and extracted passages stay on this computer. The current question, up to three recent chat turns, and selected passages go to KerocheAI or the configured Ollama server.
 - Retrieval uses lexical BM25 matching; it can miss relevant passages when a question uses very different wording from the notes. Try course keywords and document-type filters.

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import math
 import os
 import re
 import sqlite3
 import zipfile
+import uuid
 from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
@@ -52,6 +54,7 @@ def db() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("""CREATE TABLE IF NOT EXISTS chunks (
         id INTEGER PRIMARY KEY, file_hash TEXT NOT NULL, filename TEXT NOT NULL,
         category TEXT NOT NULL, location TEXT NOT NULL, content TEXT NOT NULL,
@@ -77,6 +80,31 @@ def db() -> sqlite3.Connection:
             raise
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(file_hash)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_category ON chunks(category)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS chats (
+        id TEXT PRIMARY KEY, title TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY,
+        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+        content TEXT NOT NULL,
+        sources_json TEXT NOT NULL DEFAULT '[]',
+        provider TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(chat_id, ordinal)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS chat_documents (
+        chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+        file_hash TEXT NOT NULL,
+        category TEXT NOT NULL,
+        attached_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(chat_id, file_hash)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_order ON messages(chat_id, ordinal)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_documents_file ON chat_documents(file_hash)")
     return conn
 
 
@@ -307,7 +335,7 @@ def split_text(text: str) -> list[str]:
     return result
 
 
-def ingest(upload, category: str) -> tuple[int, str]:
+def ingest(upload, category: str, chat_id: str) -> tuple[int, str]:
     raw = upload.getvalue()
     if len(raw) > MAX_UPLOAD_BYTES:
         raise ValueError("This file is larger than the 50 MB upload limit.")
@@ -327,12 +355,14 @@ def ingest(upload, category: str) -> tuple[int, str]:
         try:
             conn.execute("BEGIN IMMEDIATE")
             if conn.execute("SELECT 1 FROM chunks WHERE file_hash=? LIMIT 1", (digest,)).fetchone():
-                conn.rollback()
-                return 0, "already indexed"
+                conn.execute("INSERT OR IGNORE INTO chat_documents(chat_id,file_hash,category) VALUES(?,?,?)", (chat_id, digest, category))
+                conn.commit()
+                return 0, "already in library; attached to this chat"
             conn.executemany("INSERT INTO chunks(file_hash,filename,category,location,content) VALUES(?,?,?,?,?)", [
                 (digest, filename, category, location, content)
                 for location, content in entries
             ])
+            conn.execute("INSERT INTO chat_documents(chat_id,file_hash,category) VALUES(?,?,?)", (chat_id, digest, category))
             conn.commit()
         except Exception:
             conn.rollback()
@@ -340,9 +370,11 @@ def ingest(upload, category: str) -> tuple[int, str]:
     return len(entries), "indexed"
 
 
-def retrieve(question: str, categories: list[str], limit: int = 7) -> list[dict[str, Any]]:
+def retrieve(question: str, categories: list[str], chat_id: str, limit: int = 7) -> list[dict[str, Any]]:
     with closing(db()) as conn:
-        rows = conn.execute("SELECT file_hash,filename,category,location,content FROM chunks").fetchall()
+        rows = conn.execute("""SELECT c.file_hash,c.filename,d.category,c.location,c.content
+            FROM chunks AS c JOIN chat_documents AS d ON d.file_hash=c.file_hash
+            WHERE d.chat_id=?""", (chat_id,)).fetchall()
     rows = [row for row in rows if not categories or row["category"] in categories]
     if not rows:
         return []
@@ -448,14 +480,115 @@ def build_revision_guide(passages: list[dict[str, Any]], model: str, allow_exten
 
 def library_rows():
     with closing(db()) as conn:
-        return conn.execute("SELECT file_hash, filename, category, COUNT(*) AS pieces, MIN(created_at) AS added FROM chunks GROUP BY file_hash ORDER BY filename").fetchall()
+        return conn.execute("""SELECT c.file_hash,c.filename,MIN(c.category) AS category,COUNT(*) AS pieces,
+            MIN(c.created_at) AS added,
+            (SELECT COUNT(*) FROM chat_documents AS d WHERE d.file_hash=c.file_hash) AS chat_count
+            FROM chunks AS c GROUP BY c.file_hash,c.filename ORDER BY c.filename""").fetchall()
+
+
+def chat_library(chat_id: str):
+    with closing(db()) as conn:
+        return conn.execute("""SELECT d.file_hash,c.filename,d.category,COUNT(*) AS pieces
+            FROM chat_documents AS d JOIN chunks AS c ON c.file_hash=d.file_hash
+            WHERE d.chat_id=? GROUP BY d.file_hash,c.filename,d.category ORDER BY c.filename""", (chat_id,)).fetchall()
+
+
+def list_chats():
+    with closing(db()) as conn:
+        return conn.execute("SELECT id,title,created_at,updated_at FROM chats ORDER BY updated_at DESC,created_at DESC").fetchall()
+
+
+def create_chat(title: str = "New chat") -> str:
+    chat_id = str(uuid.uuid4())
+    with closing(db()) as conn:
+        conn.execute("INSERT INTO chats(id,title) VALUES(?,?)", (chat_id, title))
+        conn.commit()
+    return chat_id
+
+
+def load_messages(chat_id: str) -> list[dict[str, Any]]:
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT role,content,sources_json,provider FROM messages WHERE chat_id=? ORDER BY ordinal", (chat_id,)).fetchall()
+    messages = []
+    for row in rows:
+        try:
+            sources = json.loads(row["sources_json"] or "[]")
+            if not isinstance(sources, list):
+                sources = []
+        except (TypeError, json.JSONDecodeError):
+            sources = []
+        messages.append({"role": row["role"], "content": row["content"], "sources": sources, "provider": row["provider"]})
+    return messages
+
+
+def save_message(chat_id: str, role: str, content: str, sources: list[dict[str, Any]] | None = None, provider: str | None = None) -> None:
+    if role not in {"user", "assistant"}:
+        raise ValueError("Chat messages must be from the user or assistant.")
+    sources_json = json.dumps(sources or [], ensure_ascii=False, allow_nan=False)
+    with closing(db()) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            next_ordinal = conn.execute("SELECT COALESCE(MAX(ordinal),0)+1 FROM messages WHERE chat_id=?", (chat_id,)).fetchone()[0]
+            conn.execute("INSERT INTO messages(chat_id,ordinal,role,content,sources_json,provider) VALUES(?,?,?,?,?,?)", (chat_id, next_ordinal, role, content, sources_json, provider))
+            if role == "user":
+                first_prompt = " ".join(content.split())[:60] or "New chat"
+                conn.execute("UPDATE chats SET title=CASE WHEN title='New chat' THEN ? ELSE title END, updated_at=CURRENT_TIMESTAMP WHERE id=?", (first_prompt, chat_id))
+            else:
+                conn.execute("UPDATE chats SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (chat_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def ensure_initial_chat() -> str:
+    legacy_messages = st.session_state.get("messages", [])
+    with closing(db()) as conn:
+        existing = conn.execute("SELECT id FROM chats ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if existing:
+            return existing["id"]
+        has_documents = conn.execute("SELECT 1 FROM chunks LIMIT 1").fetchone() is not None
+        chat_id = str(uuid.uuid4())
+        title = "Previous library" if has_documents else "New chat"
+        conn.execute("INSERT INTO chats(id,title) VALUES(?,?)", (chat_id, title))
+        if has_documents:
+            conn.execute("""INSERT OR IGNORE INTO chat_documents(chat_id,file_hash,category)
+                SELECT ?,file_hash,MIN(category) FROM chunks GROUP BY file_hash""", (chat_id,))
+        conn.commit()
+    for message in legacy_messages:
+        if message.get("role") in {"user", "assistant"} and message.get("content"):
+            save_message(chat_id, message["role"], message["content"], message.get("sources", []), message.get("provider"))
+    return chat_id
+
+
+def attach_document(chat_id: str, file_hash: str, category: str) -> None:
+    with closing(db()) as conn:
+        conn.execute("INSERT OR IGNORE INTO chat_documents(chat_id,file_hash,category) VALUES(?,?,?)", (chat_id, file_hash, category))
+        conn.commit()
+
+
+def detach_document(chat_id: str, file_hash: str) -> None:
+    with closing(db()) as conn:
+        conn.execute("DELETE FROM chat_documents WHERE chat_id=? AND file_hash=?", (chat_id, file_hash))
+        conn.commit()
 
 
 def delete_file(file_hash: str) -> None:
     with closing(db()) as conn:
+        conn.execute("DELETE FROM chat_documents WHERE file_hash=?", (file_hash,))
         conn.execute("DELETE FROM chunks WHERE file_hash=?", (file_hash,))
         conn.commit()
 
+
+initial_chat_id = ensure_initial_chat()
+all_chats = list_chats()
+if st.session_state.get("active_chat_id") not in {chat["id"] for chat in all_chats}:
+    st.session_state.active_chat_id = initial_chat_id
+if st.session_state.get("history_chat_id") not in {chat["id"] for chat in all_chats}:
+    st.session_state.history_chat_id = st.session_state.active_chat_id
+if st.session_state.get("loaded_chat_id") != st.session_state.active_chat_id:
+    st.session_state.messages = load_messages(st.session_state.active_chat_id)
+    st.session_state.loaded_chat_id = st.session_state.active_chat_id
 
 title_icon, title_text = st.columns([0.09, 0.91], vertical_alignment="center")
 with title_icon:
@@ -465,7 +598,73 @@ with title_text:
     st.caption("Upload your own documents, ask questions, and get answers grounded in cited passages from your library.")
 
 with st.sidebar:
-    st.header("Your library")
+    st.header("Your chats")
+    if st.button("＋ New chat", type="primary", width="stretch"):
+        chat_id = create_chat()
+        st.session_state.active_chat_id = chat_id
+        st.session_state.history_chat_id = chat_id
+        st.session_state.loaded_chat_id = chat_id
+        st.session_state.messages = []
+        st.session_state.pop("guide", None)
+        st.rerun()
+    chat_options = {chat["id"]: chat["title"] for chat in all_chats}
+    st.selectbox("Chat history", list(chat_options), format_func=lambda chat_id: chat_options[chat_id], key="history_chat_id", label_visibility="collapsed")
+    selected_chat_id = st.session_state.history_chat_id
+    if selected_chat_id != st.session_state.active_chat_id:
+        st.session_state.active_chat_id = selected_chat_id
+        st.session_state.loaded_chat_id = selected_chat_id
+        st.session_state.messages = load_messages(selected_chat_id)
+        st.session_state.pop("guide", None)
+        st.rerun()
+
+    active_chat_id = st.session_state.active_chat_id
+    st.divider()
+    st.header("Documents in this chat")
+    rows = chat_library(active_chat_id)
+    library = library_rows()
+    attached_hashes = {row["file_hash"] for row in rows}
+    available = [row for row in library if row["file_hash"] not in attached_hashes]
+    if available:
+        labels = {row["file_hash"]: f"{row['filename']} · {row['category']}" for row in available}
+        selected_files = st.multiselect("Attach from library", list(labels), format_func=lambda file_hash: labels[file_hash], key=f"attach-{active_chat_id}")
+        if st.button("Attach selected files", disabled=not selected_files, width="stretch"):
+            for row in available:
+                if row["file_hash"] in selected_files:
+                    attach_document(active_chat_id, row["file_hash"], row["category"])
+            st.rerun()
+    st.caption("Files attached here are the only documents used to answer this chat.")
+    for row in rows:
+        left, right = st.columns([5, 1])
+        left.caption(f"{row['filename']} · {row['category']} · {row['pieces']} passages")
+        if right.button("×", key=f"detach-{active_chat_id}-{row['file_hash']}", help="Remove from this chat"):
+            detach_document(active_chat_id, row["file_hash"])
+            st.rerun()
+
+    st.subheader("Add documents to this chat")
+    uploads = st.file_uploader("Upload documents", type=["pdf", "docx", "pptx", "txt", "md"], accept_multiple_files=True, key=f"upload-{active_chat_id}")
+    category = st.selectbox("Document type", ["Lecture notes", "Course outline", "Past paper", "Other"], key=f"category-{active_chat_id}")
+    if st.button("Index uploaded documents", type="primary", disabled=not uploads, width="stretch"):
+        progress = st.progress(0)
+        for i, file in enumerate(uploads):
+            try:
+                count, status = ingest(file, category, active_chat_id)
+                st.toast(f"{file.name}: {count} sections {status}")
+            except Exception as exc:
+                st.error(f"{file.name}: {exc}")
+            progress.progress((i + 1) / len(uploads))
+        st.rerun()
+
+    with st.expander("Manage the full document library"):
+        rows_all = library_rows()
+        st.caption("Deleting a file removes it from every chat.")
+        for row in rows_all:
+            left, right = st.columns([5, 1])
+            left.caption(f"{row['filename']} · {row['category']} · {row['pieces']} passages · {row['chat_count']} chats")
+            if right.button("✕", key=f"del-{row['file_hash']}", help="Delete from library and all chats"):
+                delete_file(row["file_hash"])
+                st.rerun()
+    st.divider()
+    st.header("AI settings")
     st.text_input("KerocheAI API URL", value=setting("KEROCHEAI_BASE_URL") or DEFAULT_KEROCHEAI_URL, key="kerocheai_base_url", help="Use the API base URL shown in KerocheAI → Settings → Developer API.")
     has_saved_key = bool(setting("KEROCHEAI_API_KEY"))
     st.text_input("KerocheAI developer key", type="password", key="kerocheai_api_key", help="Create a key in KerocheAI → Settings → Developer API. This stays in this browser session.")
@@ -494,34 +693,11 @@ with st.sidebar:
         st.selectbox("AI model", model_names, key="selected_model")
     else:
         st.text_input("AI model name", value=configured_model, key="selected_model")
-    uploads = st.file_uploader("Add documents", type=["pdf", "docx", "pptx", "txt", "md"], accept_multiple_files=True)
-    category = st.selectbox("Document type", ["Lecture notes", "Course outline", "Past paper", "Other"])
-    if st.button("Index uploaded documents", type="primary", disabled=not uploads, width="stretch"):
-        progress = st.progress(0)
-        for i, file in enumerate(uploads):
-            try:
-                count, status = ingest(file, category)
-                st.toast(f"{file.name}: {count} sections {status}")
-            except Exception as exc:
-                st.error(f"{file.name}: {exc}")
-            progress.progress((i + 1) / len(uploads))
-        st.rerun()
-    rows = library_rows()
-    st.subheader(f"Indexed documents ({len(rows)})")
-    for row in rows:
-        left, right = st.columns([5, 1])
-        left.caption(f"{row['filename']} · {row['category']} · {row['pieces']} passages")
-        if right.button("✕", key=f"del-{row['file_hash']}", help="Remove document"):
-            delete_file(row["file_hash"])
-            st.rerun()
-
 tab_chat, tab_guide, tab_setup = st.tabs(["Ask your library", "Exam revision guide", "Setup"])
 
 with tab_chat:
     cats = sorted({row["category"] for row in rows})
     chosen = st.multiselect("Search in", cats, default=cats, help="Choose document groups to use as evidence.")
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -534,6 +710,7 @@ with tab_chat:
     prompt = st.chat_input("Ask a question about your documents")
     if prompt:
         st.session_state.messages.append({"role": "user", "content": prompt})
+        save_message(active_chat_id, "user", prompt)
         with st.chat_message("user"):
             st.markdown(prompt)
         with st.chat_message("assistant"):
@@ -545,7 +722,7 @@ with tab_chat:
                 ][-6:]
                 previous_question = next((message["content"] for message in reversed(history) if message["role"] == "user"), "")
                 retrieval_query = f"{previous_question} {prompt}" if previous_question and len(prompt.split()) <= 8 else prompt
-                hits = retrieve(retrieval_query, chosen)
+                hits = retrieve(retrieval_query, chosen, active_chat_id)
                 result = answer(prompt, hits, st.session_state.get("selected_model", ""), history=history)
                 st.markdown(result.content)
                 st.caption(f"Answered with {result.provider}")
@@ -554,6 +731,7 @@ with tab_chat:
                         for i, source in enumerate(hits, 1):
                             st.markdown(f"**[S{i}] {source['filename']} · {source['location']}**\n\n> {source['content']}")
                 st.session_state.messages.append({"role": "assistant", "content": result.content, "sources": hits, "provider": result.provider})
+                save_message(active_chat_id, "assistant", result.content, hits, result.provider)
             except Exception as exc:
                 st.error(str(exc))
 
@@ -566,7 +744,7 @@ with tab_guide:
     if st.button("Generate revision guide", type="primary", disabled=not rows):
         query = "Course key definitions, concepts, principles, advantages, disadvantages, comparisons, lists, and examples. Past paper questions and their years or paper labels. Provide evidence for a comprehensive exam revision guide."
         try:
-            passages = retrieve(query, scope, limit=MAX_GUIDE_PASSAGES)
+            passages = retrieve(query, scope, active_chat_id, limit=MAX_GUIDE_PASSAGES)
             if not passages:
                 st.warning("I couldn't find matching passages. Check your selected document types or try indexing the files again.")
             else:
